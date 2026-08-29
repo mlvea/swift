@@ -30,6 +30,7 @@
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/SILType.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/GlobalVariable.h"
 
 #include "GenHeap.h"
 #include "GenRecord.h"
@@ -581,19 +582,80 @@ Address irgen::projectTupleElementAddress(IRGenFunction &IGF,
                  tupleType, fieldNo);
 }
 
+/// If every element of \p tupleType has a statically-known byte offset,
+/// return the offset of element \p index as an i32. A constant index becomes
+/// an i32 constant; a dynamic index loads from a private offset table.
+static llvm::Value *emitFixedTupleElementOffset(IRGenFunction &IGF,
+                                                SILType tupleType,
+                                                llvm::Value *index) {
+  auto tuple = tupleType.castTo<TupleType>();
+  unsigned n = tuple->getNumElements();
+  if (n == 0)
+    return nullptr;
+
+  SmallVector<llvm::Constant *, 8> offsetConsts;
+  offsetConsts.reserve(n);
+  for (unsigned i = 0; i != n; ++i) {
+    auto off = getFixedTupleElementOffset(IGF.IGM, tupleType, i);
+    if (!off)
+      return nullptr;
+    offsetConsts.push_back(
+        llvm::ConstantInt::get(IGF.IGM.Int32Ty, off->getValue()));
+  }
+
+  if (auto *ci = dyn_cast<llvm::ConstantInt>(index)) {
+    uint64_t i = ci->getZExtValue();
+    if (i >= n)
+      return nullptr;
+    return offsetConsts[i];
+  }
+
+  auto *arrayTy = llvm::ArrayType::get(IGF.IGM.Int32Ty, n);
+  auto *init = llvm::ConstantArray::get(arrayTy, offsetConsts);
+  auto *gv = new llvm::GlobalVariable(
+      IGF.IGM.Module, arrayTy, /*isConstant=*/true,
+      llvm::GlobalValue::PrivateLinkage, init, "tuple_element_offsets");
+  gv->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+  gv->setAlignment(llvm::MaybeAlign(4));
+
+  llvm::Value *idx = index;
+  if (idx->getType() != IGF.IGM.SizeTy)
+    idx = IGF.Builder.CreateZExtOrTrunc(idx, IGF.IGM.SizeTy);
+  llvm::Value *indices[] = {
+      llvm::ConstantInt::get(IGF.IGM.SizeTy, 0),
+      idx,
+  };
+  auto *slot = IGF.Builder.CreateInBoundsGEP(arrayTy, gv, indices);
+  return IGF.Builder.CreateLoad(slot, IGF.IGM.Int32Ty, Alignment(4),
+                                "tuple.dynamic.offset");
+}
+
 Address irgen::projectTupleElementAddressByDynamicIndex(IRGenFunction &IGF,
                                                         Address tuple,
                                                         SILType tupleType,
                                                         llvm::Value *index,
                                                         SILType elementType) {
-  auto *metadata = IGF.emitTypeMetadataRefForLayout(tupleType);
+  auto loweredTupleType = tupleType.castTo<TupleType>();
 
+  // Prefer statically-known offsets over tuple metadata. Embedded Swift's
+  // tuple metadata is only a value-witness table plus a kind, so loading
+  // TupleTypeMetadata.Elements from it is undefined (#89581).
+  if (!loweredTupleType->containsPackExpansionType()) {
+    if (auto *offset = emitFixedTupleElementOffset(IGF, tupleType, index)) {
+      auto *gep = IGF.emitByteOffsetGEP(tuple.getAddress(), offset);
+      auto elementAddress =
+          Address(gep, IGF.IGM.OpaqueTy, IGF.IGM.getPointerAlignment());
+      return IGF.Builder.CreateElementBitCast(
+          elementAddress, IGF.IGM.getStorageType(elementType));
+    }
+  }
+
+  auto *metadata = IGF.emitTypeMetadataRefForLayout(tupleType);
 
   llvm::BasicBlock *trueBB = nullptr, *falseBB = nullptr, *restBB = nullptr;
   llvm::BasicBlock *unwrappedBB = nullptr;
   llvm::Value *unwrappedOffset = nullptr;
 
-  auto loweredTupleType = tupleType.castTo<TupleType>();
   if (loweredTupleType->getNumScalarElements() <= 1) {
     ConditionalDominanceScope scope(IGF);
 
